@@ -15,11 +15,14 @@ RUN pip install --no-cache-dir \
     vosk \
     gradio \
     numpy==1.26.4 \
-    torch \
-    torchaudio \
     librosa \
     chatterbox-tts \
     peft
+
+# Install PyTorch with CUDA support and Triton
+RUN pip install --no-cache-dir \
+    torch torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+    triton>=2.0.0
 
 # Set working directory
 WORKDIR /app
