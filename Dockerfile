@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     unzip \
+    coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -30,10 +31,11 @@ WORKDIR /app
 # Copy application code and scripts
 COPY app.py /app/app.py
 COPY download_models.sh /app/download_models.sh
+COPY stop_inactive_pod.py /app/stop_inactive_pod.py
 RUN chmod +x /app/download_models.sh
 
 # Expose Gradio port
 EXPOSE 7860
 
-# Run the model download script and start Gradio
-CMD ["/bin/bash", "-c", "./download_models.sh && python app.py"]
+# Run model download, start Gradio with logging, and run inactivity monitor
+CMD ["/bin/bash", "-c", "./download_models.sh && nohup python stop_inactive_pod.py & python app.py > app.log 2>&1"]

@@ -10,6 +10,8 @@ import torchaudio
 import logging
 import traceback
 import sys
+import subprocess
+import tempfile
 from datetime import datetime
 from chatterbox.tts import ChatterboxTTS
 
@@ -141,6 +143,19 @@ def transcribe_whisper(audio_file):
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
+def transcribe_whisper_filepath(file_path):
+    """Whisper transcription function that accepts server-side file paths"""
+    logger.info(f"Whisper filepath transcription started for: {file_path}")
+    
+    # Check if file exists on server
+    if not os.path.exists(file_path):
+        error_msg = f"File not found on server: {file_path}"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    # Use the existing transcribe_whisper function
+    return transcribe_whisper(file_path)
+
 def transcribe_vosk(audio_file, sample_rate=16000):
     logger.info(f"VOSK transcription started for file: {audio_file} with sample rate: {sample_rate}")
     start_time = datetime.now()
@@ -188,20 +203,56 @@ def transcribe_vosk(audio_file, sample_rate=16000):
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
-def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None):
+def transcribe_vosk_filepath(file_path, sample_rate=16000):
+    """VOSK transcription function that accepts server-side file paths"""
+    logger.info(f"VOSK filepath transcription started for: {file_path}")
+    
+    # Check if file exists on server
+    if not os.path.exists(file_path):
+        error_msg = f"File not found on server: {file_path}"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    # Use the existing transcribe_vosk function
+    return transcribe_vosk(file_path, sample_rate)
+
+def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None):
     logger.info(f"Chatterbox TTS started for text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
     start_time = datetime.now()
     
     try:
         # Log parameters
-        logger.info(f"Parameters - exaggeration: {exaggeration}, cfg_weight: {cfg_weight}, temperature: {temperature}, seed: {random_seed}")
+        logger.info(f"Parameters - exaggeration: {exaggeration}, cfg_weight: {cfg_weight}, temperature: {temperature}, seed: {random_seed}, custom_filename: {output_filename}")
         
-        if audio_prompt:
-            if os.path.exists(audio_prompt):
-                prompt_size = os.path.getsize(audio_prompt) / (1024 * 1024)  # MB
-                logger.info(f"Using audio prompt: {audio_prompt} ({prompt_size:.2f}MB)")
-            else:
-                logger.warning(f"Audio prompt file not found: {audio_prompt}")
+        # Create output directory if it doesn't exist
+        output_dir = "/app/audio/output"
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Output directory ensured: {output_dir}")
+        
+        # Determine output filename based on priority: custom filename > audio prompt filename > timestamp
+        if output_filename:
+            # User provided custom filename
+            name_without_ext = os.path.splitext(output_filename)[0]
+            final_output_filename = f"{name_without_ext}.wav"
+            logger.info(f"Using custom filename: {final_output_filename}")
+        elif audio_prompt and os.path.exists(audio_prompt):
+            prompt_size = os.path.getsize(audio_prompt) / (1024 * 1024)  # MB
+            logger.info(f"Using audio prompt: {audio_prompt} ({prompt_size:.2f}MB)")
+            
+            # Extract filename from audio prompt path and use it for output
+            input_filename = os.path.basename(audio_prompt)
+            # Keep the same name but ensure .wav extension
+            name_without_ext = os.path.splitext(input_filename)[0]
+            final_output_filename = f"{name_without_ext}.wav"
+            logger.info(f"Using audio prompt filename: {final_output_filename}")
+        else:
+            # If no custom filename or audio prompt, create a generic filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            final_output_filename = f"chatterbox_output_{timestamp}.wav"
+            logger.info("No custom filename or audio prompt provided, using timestamp-based filename")
+        
+        output_path = os.path.join(output_dir, final_output_filename)
+        logger.info(f"Output will be saved as: {output_path}")
         
         # Prepare generation parameters
         generation_params = {
@@ -219,24 +270,153 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
         else:
             wav = chatterbox_model.generate(text, **generation_params)
         
-        output_path = "output_audio.wav"
-        logger.info(f"Saving audio to: {output_path}")
-        torchaudio.save(output_path, wav, chatterbox_model.sr)
+        # Try direct encoding first (faster), fallback to FFmpeg if needed
+        logger.info("Converting audio to standard format (mono, 16kHz, 16-bit)...")
+        
+        try:
+            # Method 1: Direct PyTorch conversion (faster)
+            logger.info("Attempting direct PyTorch conversion...")
+            
+            # Convert to mono if stereo
+            if wav.shape[0] > 1:
+                wav = torch.mean(wav, dim=0, keepdim=True)
+                logger.info("Converted stereo to mono")
+            
+            # Resample to 16kHz if needed
+            original_sr = chatterbox_model.sr
+            target_sr = 16000
+            if original_sr != target_sr:
+                logger.info(f"Resampling from {original_sr}Hz to {target_sr}Hz")
+                resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=target_sr)
+                wav = resampler(wav)
+            
+            # Save directly with target format
+            logger.info(f"Saving audio directly to: {output_path}")
+            torchaudio.save(output_path, wav, target_sr, bits_per_sample=16)
+            
+            # Verify the file was created successfully
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
+                logger.info("✓ Direct PyTorch conversion successful")
+                conversion_method = "PyTorch (direct)"
+            else:
+                raise RuntimeError("Direct conversion produced invalid file")
+                
+        except Exception as e:
+            logger.warning(f"Direct conversion failed: {e}, falling back to FFmpeg...")
+            conversion_method = "FFmpeg (fallback)"
+            
+            # Method 2: FFmpeg fallback (more reliable)
+            logger.info("Saving to temporary file for FFmpeg conversion...")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+                # Save with original sample rate first
+                torchaudio.save(temp_path, wav, chatterbox_model.sr)
+            
+            logger.info(f"Converting with FFmpeg...")
+            
+            # Use FFmpeg to convert to desired format
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",  # -y to overwrite output file
+                "-i", temp_path,  # input file
+                "-ac", "1",       # mono (1 channel)
+                "-ar", "16000",   # 16kHz sample rate
+                "-sample_fmt", "s16",  # 16-bit signed integer
+                "-f", "wav",      # WAV format
+                output_path       # output file
+            ]
+            
+            try:
+                logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+                logger.info("✓ FFmpeg conversion completed successfully")
+                
+                # Clean up temporary file
+                os.unlink(temp_path)
+                logger.info("Temporary file cleaned up")
+                
+            except subprocess.CalledProcessError as e:
+                logger.error(f"FFmpeg conversion failed: {e}")
+                logger.error(f"FFmpeg stderr: {e.stderr}")
+                
+                # Last resort: move temp file to final location
+                logger.info("Using original audio format (no conversion)")
+                os.rename(temp_path, output_path)
+                conversion_method = "Original (no conversion)"
+                
+            except FileNotFoundError:
+                logger.error("FFmpeg not found! Using original audio format")
+                os.rename(temp_path, output_path)
+                conversion_method = "Original (FFmpeg not found)"
+        
+        logger.info(f"Audio saved as: {output_path} (method: {conversion_method})")
         
         # Log output info
         if os.path.exists(output_path):
             output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
             duration = (datetime.now() - start_time).total_seconds()
             logger.info(f"✓ Chatterbox TTS completed in {duration:.2f}s")
-            logger.info(f"Generated audio file: {output_size:.2f}MB")
+            logger.info(f"Generated audio file: {output_path} ({output_size:.2f}MB)")
+            
+            # Verify audio format with FFprobe if available
+            try:
+                ffprobe_cmd = [
+                    "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", output_path
+                ]
+                probe_result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+                probe_data = json.loads(probe_result.stdout)
+                
+                if "streams" in probe_data and len(probe_data["streams"]) > 0:
+                    audio_stream = probe_data["streams"][0]
+                    logger.info(f"Audio format verification - Channels: {audio_stream.get('channels', 'unknown')}, "
+                              f"Sample Rate: {audio_stream.get('sample_rate', 'unknown')}, "
+                              f"Bit Depth: {audio_stream.get('bits_per_sample', 'unknown')}")
+            except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+                logger.info("Could not verify audio format with ffprobe")
+            
+            # Return detailed result for API
+            result = {
+                "audio_file": output_path,
+                "output_path": output_path,
+                "filename": final_output_filename,
+                "file_size_mb": round(output_size, 2),
+                "generation_time_seconds": round(duration, 2),
+                "audio_format": "mono WAV, 16kHz, 16-bit",
+                "conversion_method": conversion_method,
+                "parameters": {
+                    "exaggeration": exaggeration,
+                    "cfg_weight": cfg_weight,
+                    "temperature": temperature,
+                    "random_seed": random_seed,
+                    "custom_filename": output_filename
+                },
+                "text_length": len(text),
+                "used_audio_prompt": bool(audio_prompt and os.path.exists(audio_prompt))
+            }
+            logger.info(f"API result: {result}")
+            return result
+        else:
+            error_msg = f"Generated file not found at {output_path}"
+            logger.error(error_msg)
+            return {"error": error_msg, "output_path": output_path}
         
-        return output_path
     except Exception as e:
         duration = (datetime.now() - start_time).total_seconds()
         error_msg = f"Chatterbox cloning error after {duration:.2f}s: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
-        return error_msg
+        return {"error": error_msg}
+
+def chatterbox_clone_gradio(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None):
+    """Wrapper function for Gradio interface that returns just the audio file path"""
+    result = chatterbox_clone(text, audio_prompt, exaggeration, cfg_weight, temperature, random_seed, output_filename)
+    
+    if isinstance(result, dict):
+        if "error" in result:
+            return None, result  # Return None for audio, error dict for JSON
+        else:
+            return result["audio_file"], result  # Return audio file path and full result
+    else:
+        return result, {"error": "Unexpected result format"}  # Fallback
 
 # Gradio Interface with custom endpoint names and new parameters
 logger.info("Setting up Gradio interfaces...")
@@ -252,6 +432,16 @@ try:
     )
     logger.info("✓ Whisper interface created")
 
+    logger.info("Creating Whisper filepath interface...")
+    whisper_filepath_iface = gr.Interface(
+        fn=transcribe_whisper_filepath,
+        inputs=gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
+        outputs=gr.JSON(label="Whisper Result"),
+        title="OpenAI Whisper Turbo (Server Files)",
+        api_name="whisper_filepath"
+    )
+    logger.info("✓ Whisper filepath interface created")
+
     logger.info("Creating VOSK interface...")
     vosk_iface = gr.Interface(
         fn=transcribe_vosk,
@@ -265,25 +455,43 @@ try:
     )
     logger.info("✓ VOSK interface created")
 
+    logger.info("Creating VOSK filepath interface...")
+    vosk_filepath_iface = gr.Interface(
+        fn=transcribe_vosk_filepath,
+        inputs=[
+            gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
+            gr.Number(label="Sample Rate", value=16000, precision=0)
+        ],
+        outputs=gr.JSON(label="VOSK Result"),
+        title="VOSK Transcription (Server Files)",
+        api_name="vosk_filepath"
+    )
+    logger.info("✓ VOSK filepath interface created")
+
     logger.info("Creating Chatterbox interface...")
     chatterbox_iface = gr.Interface(
-        fn=chatterbox_clone,
+        fn=chatterbox_clone_gradio,
         inputs=[
             gr.Textbox(label="Text to clone"),
             gr.Audio(type="filepath", label="Reference audio (optional for voice cloning)"),
             gr.Slider(minimum=0, maximum=1, value=0.5, label="Exaggeration (emotion intensity)"),
             gr.Slider(minimum=0, maximum=1, value=0.5, label="CFG Weight (pacing control)"),
             gr.Slider(minimum=0.1, maximum=2.0, value=1.0, label="Temperature"),
-            gr.Number(label="Random Seed", value=None, precision=0)
+            gr.Number(label="Random Seed", value=None, precision=0),
+            gr.Textbox(label="Output Filename (optional)", placeholder="e.g., my_voice_clone", info="Will be saved as .wav file. If empty, uses audio prompt filename or timestamp.")
         ],
-        outputs=gr.Audio(type="filepath", label="Generated Audio"),
+        outputs=[
+            gr.Audio(type="filepath", label="Generated Audio"),
+            gr.JSON(label="Generation Details")
+        ],
         title="Resemble.AI Chatterbox Voice Cloning",
         api_name="chatterbox"
     )
     logger.info("✓ Chatterbox interface created")
 
     logger.info("Creating tabbed interface...")
-    app = gr.TabbedInterface([whisper_iface, vosk_iface, chatterbox_iface], ["Whisper", "VOSK", "Chatterbox"])
+    app = gr.TabbedInterface([whisper_iface, whisper_filepath_iface, vosk_iface, vosk_filepath_iface, chatterbox_iface], 
+                           ["Whisper", "Whisper Files", "VOSK", "VOSK Files", "Chatterbox"])
     logger.info("✓ All Gradio interfaces created successfully")
 
 except Exception as e:
