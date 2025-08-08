@@ -221,6 +221,12 @@ def stop_pod():
             logger.info(f"S3 log upload results: {upload_results}")
         except Exception as e:
             logger.error(f"Error uploading logs to S3: {e}")
+        # Centralized shutdown (idempotent)
+        try:
+            perform_pod_shutdown(shutdown_reason="inactivity_monitor", logger=logger)
+        except Exception as e:
+            logger.warning(f"perform_pod_shutdown failed: {e}")
+
         subprocess.run(["runpodctl", "stop", "pod", pod_id])
         logger.info(f"Pod {pod_id} stopped due to inactivity.")
     else:

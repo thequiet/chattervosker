@@ -1,7 +1,8 @@
 #!/bin/bash
 # Startup script for ChatterVosker application
 
-# Enable debugging
+# Safer bash options
+set -euo pipefail
 set -x  # Print commands as they are executed
 
 echo "=================================================="
@@ -40,7 +41,8 @@ if [ "$AVAILABLE_SPACE" -lt 5000000000 ]; then
     exit 1
 fi
 # Check memory using /proc/meminfo (free command not available in container)
-AVAILABLE_MEMORY=$(awk '/MemAvailable:/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 4000000001)
+AVAILABLE_MEMORY_KB=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 4000001)
+AVAILABLE_MEMORY=$((AVAILABLE_MEMORY_KB * 1024))
 if [ "$AVAILABLE_MEMORY" -lt 4000000000 ]; then
     echo "ERROR: Insufficient memory. Need 4GB, have $AVAILABLE_MEMORY bytes."
     exit 1
@@ -153,9 +155,13 @@ echo "=================================================="
 
 # Start the application and capture its PID
 echo "Starting application..."
-python app.py 2>&1 | tee -a app.log &
+# Start python directly so APP_PID reflects python, not tee.
+python app.py >> app.log 2>&1 &
 APP_PID=$!
 echo "✓ Main application started (PID: $APP_PID)"
+# Stream logs to console in background for visibility
+tail -n +1 -F app.log &
+TAIL_PID=$!
 
 # Give the app a moment to start and check if it's still running
 sleep 5
@@ -188,6 +194,12 @@ if [ ! -z "$MONITOR_PID" ]; then
     kill $MONITOR_PID 2>/dev/null || true
 else
     echo "No monitor PID to clean up"
+fi
+
+# Clean up tailer
+if [ ! -z "${TAIL_PID:-}" ]; then
+    echo "Stopping log tailer..."
+    kill $TAIL_PID 2>/dev/null || true
 fi
 
 exit $APP_EXIT_CODE
