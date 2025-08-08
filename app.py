@@ -15,6 +15,8 @@ import tempfile
 import signal
 from datetime import datetime
 from chatterbox.tts import ChatterboxTTS
+import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -122,6 +124,68 @@ if torch.cuda.is_available():
     logger.info(f"GPU Memory after loading models: {torch.cuda.memory_allocated() / 1024**3:.1f}GB allocated")
 
 logger.info("All available models loaded successfully!")
+
+# S3 configuration and helpers
+S3_BUCKET = os.environ.get("S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
+S3_PREFIX = os.environ.get("S3_PREFIX") or os.environ.get("S3_DIR") or "uploads"
+S3_REGION = os.environ.get("S3_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+AWS_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+_s3_client = None
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    try:
+        session_kwargs = {}
+        client_kwargs = {}
+        if S3_REGION:
+            session_kwargs["region_name"] = S3_REGION
+        if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+            client_kwargs.update({
+                "aws_access_key_id": AWS_ACCESS_KEY_ID,
+                "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+            })
+        session = boto3.session.Session(**session_kwargs) if session_kwargs else boto3
+        _s3_client = session.client("s3", **client_kwargs)
+        logger.info("✓ Initialized S3 client")
+        return _s3_client
+    except Exception as e:
+        logger.error(f"Failed to initialize S3 client: {e}")
+        return None
+
+def s3_upload_file(local_path, key_prefix=S3_PREFIX):
+    if not S3_BUCKET:
+        logger.info("S3_BUCKET not set; skipping S3 upload")
+        return None
+    client = get_s3_client()
+    if client is None:
+        return None
+    try:
+        basename = os.path.basename(local_path)
+        date_prefix = datetime.utcnow().strftime("%Y/%m/%d")
+        key_parts = [p for p in [key_prefix, date_prefix, basename] if p]
+        s3_key = "/".join([part.strip("/") for part in key_parts])
+        logger.info(f"Uploading {local_path} to s3://{S3_BUCKET}/{s3_key}")
+        client.upload_file(local_path, S3_BUCKET, s3_key)
+        url = f"s3://{S3_BUCKET}/{s3_key}"
+        # Try to construct HTTPS URL if region and public access allow
+        https_url = None
+        try:
+            region = S3_REGION or client.meta.region_name
+            if region:
+                https_url = f"https://{S3_BUCKET}.s3.{region}.amazonaws.com/{s3_key}"
+        except Exception:
+            pass
+        return {"bucket": S3_BUCKET, "key": s3_key, "s3_uri": url, "https_url": https_url}
+    except (BotoCoreError, NoCredentialsError, ClientError) as e:
+        logger.error(f"S3 upload failed: {e}")
+        return {"error": str(e)}
+    except Exception as e:
+        logger.error(f"Unexpected S3 upload error: {e}")
+        return {"error": str(e)}
 
 def transcribe_whisper(audio_file):
     logger.info(f"Whisper transcription started for file: {audio_file}")
@@ -369,22 +433,27 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             logger.info(f"✓ Chatterbox TTS completed in {duration:.2f}s")
             logger.info(f"Generated audio file: {output_path} ({output_size:.2f}MB)")
             
-            # Verify audio format with FFprobe if available
+            # Verify audio format with FFprobe if available (restored)
             try:
                 ffprobe_cmd = [
                     "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", output_path
                 ]
                 probe_result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
                 probe_data = json.loads(probe_result.stdout)
-                
                 if "streams" in probe_data and len(probe_data["streams"]) > 0:
                     audio_stream = probe_data["streams"][0]
-                    logger.info(f"Audio format verification - Channels: {audio_stream.get('channels', 'unknown')}, "
-                              f"Sample Rate: {audio_stream.get('sample_rate', 'unknown')}, "
-                              f"Bit Depth: {audio_stream.get('bits_per_sample', 'unknown')}")
+                    logger.info(
+                        f"Audio format verification - Channels: {audio_stream.get('channels', 'unknown')}, "
+                        f"Sample Rate: {audio_stream.get('sample_rate', 'unknown')}, "
+                        f"Bit Depth: {audio_stream.get('bits_per_sample', 'unknown')}"
+                    )
             except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
                 logger.info("Could not verify audio format with ffprobe")
             
+            # Upload to S3 if configured
+            s3_info = s3_upload_file(output_path)
+            if s3_info:
+                logger.info(f"S3 upload info: {s3_info}")
             # Return detailed result for API
             result = {
                 "audio_file": output_path,
@@ -402,7 +471,8 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                     "custom_filename": output_filename
                 },
                 "text_length": len(text),
-                "used_audio_prompt": bool(audio_prompt and os.path.exists(audio_prompt))
+                "used_audio_prompt": bool(audio_prompt and os.path.exists(audio_prompt)),
+                "s3": s3_info,
             }
             logger.info(f"API result: {result}")
             return result
@@ -535,8 +605,8 @@ if __name__ == "__main__":
         app.launch(
             server_name="0.0.0.0", 
             server_port=7860,
-            show_error=True,  # Show detailed error messages
-            quiet=False       # Enable verbose logging
+            show_error=True,
+            quiet=False
         )
         
     except KeyboardInterrupt:
@@ -555,6 +625,13 @@ if __name__ == "__main__":
             
         sys.exit(1)
     finally:
+        # Upload logs to S3 on shutdown
+        try:
+            for p in ["/app/app.log", "/app/inactivity_monitor.log"]:
+                if os.path.exists(p):
+                    s3_upload_file(p, key_prefix=f"{S3_PREFIX}/logs")
+        except Exception as e:
+            logger.error(f"Failed to upload logs to S3 on shutdown: {e}")
         logger.info("Application terminating...")
         logger.info(f"End time: {datetime.now()}")
         logger.info("="*50)

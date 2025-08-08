@@ -5,6 +5,9 @@ import subprocess
 import logging
 import psutil  # Added for process checking
 from datetime import datetime
+import glob
+import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 
 # Configuration
 INITIAL_DELAY = int(os.environ.get("AUTOSHUTOFF_INITIAL_DELAY", "600"))  # 10 minutes to allow boot
@@ -12,6 +15,13 @@ CHECK_INTERVAL = int(os.environ.get("AUTOSHUTOFF_CHECK_INTERVAL", "60"))  # Chec
 INACTIVITY_THRESHOLD = int(os.environ.get("AUTOSHUTOFF_INACTIVITY_THRESHOLD", "600"))  # 10 minutes until pod stops
 LOG_FILE = "/app/app.log"
 MONITOR_LOG_FILE = "/app/inactivity_monitor.log"
+
+# S3 configuration (reuses same env vars as app.py)
+S3_BUCKET = os.environ.get("S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
+S3_PREFIX = os.environ.get("S3_PREFIX") or os.environ.get("S3_DIR") or "uploads"
+S3_REGION = os.environ.get("S3_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+AWS_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
 
 # Set up logging for the monitor
 logging.basicConfig(
@@ -38,6 +48,79 @@ ACTIVITY_PATTERNS = [
     r"audio_file.*\.wav",
     r"Application.*started",
 ]
+
+_s3_client = None
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    try:
+        session_kwargs = {}
+        client_kwargs = {}
+        if S3_REGION:
+            session_kwargs["region_name"] = S3_REGION
+        if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+            client_kwargs.update({
+                "aws_access_key_id": AWS_ACCESS_KEY_ID,
+                "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+            })
+        session = boto3.session.Session(**session_kwargs) if session_kwargs else boto3
+        _s3_client = session.client("s3", **client_kwargs)
+        logging.info("✓ Inactivity monitor initialized S3 client")
+        return _s3_client
+    except Exception as e:
+        logging.error(f"Failed to initialize S3 client in monitor: {e}")
+        return None
+
+def s3_upload_file(local_path, key_prefix=S3_PREFIX):
+    if not S3_BUCKET:
+        logging.info("S3_BUCKET not set; skipping S3 upload from monitor")
+        return None
+    client = get_s3_client()
+    if client is None:
+        return None
+    try:
+        basename = os.path.basename(local_path)
+        date_prefix = datetime.utcnow().strftime("%Y/%m/%d")
+        key_parts = [p for p in [key_prefix, date_prefix, basename] if p]
+        s3_key = "/".join([part.strip("/") for part in key_parts])
+        logging.info(f"Uploading log {local_path} to s3://{S3_BUCKET}/{s3_key}")
+        client.upload_file(local_path, S3_BUCKET, s3_key)
+        return {"bucket": S3_BUCKET, "key": s3_key}
+    except (BotoCoreError, NoCredentialsError, ClientError) as e:
+        logging.error(f"S3 upload failed (monitor): {e}")
+        return {"error": str(e)}
+    except Exception as e:
+        logging.error(f"Unexpected S3 upload error (monitor): {e}")
+        return {"error": str(e)}
+
+def upload_logs_to_s3():
+    try:
+        if not S3_BUCKET:
+            logging.info("S3 bucket not configured; skipping log upload")
+            return []
+        logs = set()
+        # Known logs
+        for p in ["/app/app.log", "/app/inactivity_monitor.log", "/tmp/vosk_download.log"]:
+            if os.path.exists(p):
+                logs.add(p)
+        # Any .log files in /app
+        for p in glob.glob("/app/*.log"):
+            if os.path.exists(p):
+                logs.add(p)
+        if not logs:
+            logging.info("No log files found to upload")
+            return []
+        results = []
+        for path in sorted(logs):
+            info = s3_upload_file(path, key_prefix=f"{S3_PREFIX}/logs")
+            results.append({"file": path, "result": info})
+        logging.info(f"Uploaded {len(results)} log files to S3")
+        return results
+    except Exception as e:
+        logging.error(f"Failed to upload logs to S3: {e}")
+        return []
 
 def has_recent_activity():
     try:
@@ -127,11 +210,17 @@ def stop_pod():
         logger.info("Recent log contents:")
         try:
             with open(LOG_FILE, "r") as f:
-                lines = f.readlines()[-10:]  # Last 10 lines
+                lines = f.readlines()[-10:]
                 for line in lines:
                     logger.info(f"Recent log: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading log file: {e}")
+        # Upload logs to S3 before stopping
+        try:
+            upload_results = upload_logs_to_s3()
+            logger.info(f"S3 log upload results: {upload_results}")
+        except Exception as e:
+            logger.error(f"Error uploading logs to S3: {e}")
         subprocess.run(["runpodctl", "stop", "pod", pod_id])
         logger.info(f"Pod {pod_id} stopped due to inactivity.")
     else:

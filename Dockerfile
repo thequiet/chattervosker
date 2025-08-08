@@ -19,7 +19,9 @@ RUN pip install --no-cache-dir \
     librosa \
     chatterbox-tts \
     peft \
-    psutil
+    psutil \
+    boto3 \
+    botocore
 
 # Install PyTorch with CUDA support and Triton
 RUN pip install --no-cache-dir \
