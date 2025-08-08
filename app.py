@@ -17,6 +17,7 @@ from datetime import datetime
 from chatterbox.tts import ChatterboxTTS
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+from pod_shutdown import perform_pod_shutdown
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -591,10 +592,7 @@ if __name__ == "__main__":
         # Add signal handlers for graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down gracefully...")
-            if torch.cuda.is_available():
-                logger.info("Clearing CUDA cache...")
-                torch.cuda.empty_cache()
-            logger.info("Application shutdown complete")
+            perform_pod_shutdown(shutdown_reason=f"signal:{signum}", logger=logger)
             sys.exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
@@ -617,9 +615,7 @@ if __name__ == "__main__":
         
         # Try to clean up resources
         try:
-            if torch.cuda.is_available():
-                logger.info("Attempting to clear CUDA cache...")
-                torch.cuda.empty_cache()
+            perform_pod_shutdown(shutdown_reason="startup_exception", logger=logger)
         except:
             pass
             
@@ -627,11 +623,9 @@ if __name__ == "__main__":
     finally:
         # Upload logs to S3 on shutdown
         try:
-            for p in ["/app/app.log", "/app/inactivity_monitor.log"]:
-                if os.path.exists(p):
-                    s3_upload_file(p, key_prefix=f"{S3_PREFIX}/logs")
+            perform_pod_shutdown(shutdown_reason="finally", logger=logger)
         except Exception as e:
-            logger.error(f"Failed to upload logs to S3 on shutdown: {e}")
+            logger.error(f"Failed during shutdown: {e}")
         logger.info("Application terminating...")
         logger.info(f"End time: {datetime.now()}")
         logger.info("="*50)
