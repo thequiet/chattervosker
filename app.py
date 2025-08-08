@@ -12,6 +12,7 @@ import traceback
 import sys
 import subprocess
 import tempfile
+import signal
 from datetime import datetime
 from chatterbox.tts import ChatterboxTTS
 
@@ -83,22 +84,29 @@ except Exception as e:
     raise
 
 # Load VOSK model with error handling
+vosk_model = None
 vosk_model_path = "/app/models/vosk-model-en-us-0.22"
 logger.info(f"Checking VOSK model at: {vosk_model_path}")
 
 try:
-    if os.path.exists(vosk_model_path):
+    if os.path.exists(vosk_model_path) and os.path.exists(f"{vosk_model_path}/am/final.mdl"):
         logger.info("Loading VOSK model...")
         vosk_model = Model(vosk_model_path)
         logger.info("✓ VOSK model loaded successfully")
     else:
-        error_msg = f"VOSK model not found at {vosk_model_path}"
-        logger.error(error_msg)
-        raise FileNotFoundError(error_msg)
+        logger.warning(f"VOSK model not found at {vosk_model_path}. Attempting to download...")
+        result = subprocess.run(["/app/download_models.sh"], capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(f"{vosk_model_path}/am/final.mdl"):
+            logger.info("VOSK model downloaded successfully. Loading...")
+            vosk_model = Model(vosk_model_path)
+            logger.info("✓ VOSK model loaded successfully")
+        else:
+            logger.error(f"Failed to download VOSK model: {result.stderr}")
+            logger.warning("VOSK transcription will be disabled.")
 except Exception as e:
     logger.error(f"✗ Failed to load VOSK model: {e}")
     logger.error(traceback.format_exc())
-    raise
+    logger.warning("VOSK transcription will be disabled.")
 
 # Load Chatterbox model with error handling
 try:
@@ -113,7 +121,7 @@ except Exception as e:
 if torch.cuda.is_available():
     logger.info(f"GPU Memory after loading models: {torch.cuda.memory_allocated() / 1024**3:.1f}GB allocated")
 
-logger.info("All models loaded successfully!")
+logger.info("All available models loaded successfully!")
 
 def transcribe_whisper(audio_file):
     logger.info(f"Whisper transcription started for file: {audio_file}")
@@ -159,6 +167,10 @@ def transcribe_whisper_filepath(file_path):
 def transcribe_vosk(audio_file, sample_rate=16000):
     logger.info(f"VOSK transcription started for file: {audio_file} with sample rate: {sample_rate}")
     start_time = datetime.now()
+    
+    if vosk_model is None:
+        logger.error("VOSK model not available. Transcription disabled.")
+        return {"error": "VOSK model not available"}
     
     try:
         # Log file info
@@ -507,8 +519,6 @@ if __name__ == "__main__":
         logger.info("="*50)
         
         # Add signal handlers for graceful shutdown
-        import signal
-        
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down gracefully...")
             if torch.cuda.is_available():

@@ -18,7 +18,8 @@ RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     librosa \
     chatterbox-tts \
-    peft
+    peft \
+    psutil
 
 # Install PyTorch with CUDA support and Triton
 RUN pip install --no-cache-dir \
@@ -32,10 +33,14 @@ WORKDIR /app
 COPY app.py /app/app.py
 COPY download_models.sh /app/download_models.sh
 COPY stop_inactive_pod.py /app/stop_inactive_pod.py
-RUN chmod +x /app/download_models.sh
+COPY start.sh /app/start.sh
+RUN chmod +x /app/download_models.sh /app/start.sh
+
+# Create models directory (ensure it exists, will be mounted to persistent volume)
+RUN mkdir -p /app/models
 
 # Expose Gradio port
 EXPOSE 7860
 
-# Run model download, start Gradio with logging, and run inactivity monitor
-CMD ["/bin/bash", "-c", "./download_models.sh && nohup python stop_inactive_pod.py & python app.py > app.log 2>&1"]
+# Use the startup script
+CMD ["./start.sh"]

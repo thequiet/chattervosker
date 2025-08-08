@@ -3,12 +3,13 @@ import time
 import re
 import subprocess
 import logging
+import psutil  # Added for process checking
 from datetime import datetime
 
 # Configuration
-INITIAL_DELAY = 720  # 12 minutes to allow boot
+INITIAL_DELAY = 600  # 10 minutes to allow boot
 CHECK_INTERVAL = 60  # Check every 60 seconds
-INACTIVITY_THRESHOLD = 900  # 15 minutes until pod stops
+INACTIVITY_THRESHOLD = 600  # 10 minutes until pod stops
 LOG_FILE = "/app/app.log"
 MONITOR_LOG_FILE = "/app/inactivity_monitor.log"
 
@@ -23,28 +24,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 ACTIVITY_PATTERNS = [
+    r"Starting ChatteVosker Application",
+    r"Loading.*model",
+    r"Checking VOSK model",
+    r"Initializing models",
+    r"Gradio.*interface",
     r"Whisper transcription started",
-    r"VOSK transcription started", 
+    r"VOSK transcription started",
     r"Chatterbox TTS started",
-    r"POST /whisper",
-    r"POST /whisper_filepath",
-    r"POST /vosk",
-    r"POST /vosk_filepath", 
-    r"POST /chatterbox",
-    r"POST /health",
-    r"Processing TTS request",
-    r"Completed TTS request",
-    r"API result:",  # This will catch your actual log output
-    r"generation_time_seconds",  # Another pattern from your log
-    r"audio_file.*\.wav",  # Pattern for audio file generation
-    r"TTS.*started",  # Generic TTS activity
-    r"TTS.*completed",  # Generic TTS completion
-    r"Processing.*request",  # Generic request processing
-    r"gradio.*request"  # Gradio request patterns
+    r"POST /",
+    r"API result:",
+    r"generation_time_seconds",
+    r"audio_file.*\.wav",
+    r"Application.*started",
 ]
 
 def has_recent_activity():
     try:
+        # Check if app.py is running using psutil
+        app_running = False
+        for proc in psutil.process_iter(['pid', 'cmdline']):
+            try:
+                cmdline = proc.cmdline()
+                if cmdline and 'python' in cmdline[0].lower() and 'app.py' in ' '.join(cmdline):
+                    logger.info(f"Application process found (PID: {proc.pid}, cmdline: {' '.join(cmdline)})")
+                    app_running = True
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
+        if app_running:
+            logger.info("Application process is running - assuming active")
+            return True
+        
         # Check if log file exists
         if not os.path.exists(LOG_FILE):
             logger.info(f"Log file {LOG_FILE} not found - assuming active during startup")
@@ -112,6 +124,14 @@ def stop_pod():
     pod_id = os.environ.get("RUNPOD_POD_ID")
     if pod_id:
         logger.warning(f"Stopping pod {pod_id} due to inactivity")
+        logger.info("Recent log contents:")
+        try:
+            with open(LOG_FILE, "r") as f:
+                lines = f.readlines()[-10:]  # Last 10 lines
+                for line in lines:
+                    logger.info(f"Recent log: {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading log file: {e}")
         subprocess.run(["runpodctl", "stop", "pod", pod_id])
         logger.info(f"Pod {pod_id} stopped due to inactivity.")
     else:
