@@ -39,7 +39,8 @@ if [ "$AVAILABLE_SPACE" -lt 5000000000 ]; then
     echo "ERROR: Insufficient disk space for models. Need 5GB, have $AVAILABLE_SPACE bytes."
     exit 1
 fi
-AVAILABLE_MEMORY=$(free -b | grep Mem | awk '{print $4}' || echo 0)
+# Check memory using /proc/meminfo (free command not available in container)
+AVAILABLE_MEMORY=$(awk '/MemAvailable:/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 4000000001)
 if [ "$AVAILABLE_MEMORY" -lt 4000000000 ]; then
     echo "ERROR: Insufficient memory. Need 4GB, have $AVAILABLE_MEMORY bytes."
     exit 1
@@ -85,7 +86,7 @@ else
 fi
 
 # Try to start monitor but don't fail if it doesn't work
-if python stop_inactive_pod.py &; then
+if python stop_inactive_pod.py & then
     MONITOR_PID=$!
     echo "✓ Inactivity monitor started (PID: $MONITOR_PID)"
     sleep 2  # Give it a moment to start
