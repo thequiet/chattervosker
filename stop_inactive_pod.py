@@ -7,9 +7,9 @@ import psutil  # Added for process checking
 from datetime import datetime
 
 # Configuration
-INITIAL_DELAY = 600  # 10 minutes to allow boot
-CHECK_INTERVAL = 60  # Check every 60 seconds
-INACTIVITY_THRESHOLD = 600  # 10 minutes until pod stops
+INITIAL_DELAY = int(os.environ.get("AUTOSHUTOFF_INITIAL_DELAY", "600"))  # 10 minutes to allow boot
+CHECK_INTERVAL = int(os.environ.get("AUTOSHUTOFF_CHECK_INTERVAL", "60"))  # Check every 60 seconds
+INACTIVITY_THRESHOLD = int(os.environ.get("AUTOSHUTOFF_INACTIVITY_THRESHOLD", "600"))  # 10 minutes until pod stops
 LOG_FILE = "/app/app.log"
 MONITOR_LOG_FILE = "/app/inactivity_monitor.log"
 
@@ -140,9 +140,9 @@ def stop_pod():
 def main():
     logger.info("="*50)
     logger.info("Starting Inactivity Monitor")
-    logger.info(f"Initial delay: {INITIAL_DELAY} seconds")
-    logger.info(f"Check interval: {CHECK_INTERVAL} seconds") 
-    logger.info(f"Inactivity threshold: {INACTIVITY_THRESHOLD} seconds")
+    logger.info(f"Initial delay: {INITIAL_DELAY} seconds (env: INITIAL_DELAY)")
+    logger.info(f"Check interval: {CHECK_INTERVAL} seconds (env: CHECK_INTERVAL)") 
+    logger.info(f"Inactivity threshold: {INACTIVITY_THRESHOLD} seconds (env: INACTIVITY_THRESHOLD)")
     logger.info(f"Monitoring log file: {LOG_FILE}")
     logger.info(f"Monitor log file: {MONITOR_LOG_FILE}")
     logger.info("="*50)
