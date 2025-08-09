@@ -4,10 +4,13 @@ import re
 import subprocess
 import logging
 import psutil  # Added for process checking
+import shutil
+import signal
 from datetime import datetime
 import glob
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+from pod_shutdown import perform_pod_shutdown
 
 # Configuration
 INITIAL_DELAY = int(os.environ.get("AUTOSHUTOFF_INITIAL_DELAY", "600"))  # 10 minutes to allow boot
@@ -124,22 +127,6 @@ def upload_logs_to_s3():
 
 def has_recent_activity():
     try:
-        # Check if app.py is running using psutil
-        app_running = False
-        for proc in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                cmdline = proc.cmdline()
-                if cmdline and 'python' in cmdline[0].lower() and 'app.py' in ' '.join(cmdline):
-                    logger.info(f"Application process found (PID: {proc.pid}, cmdline: {' '.join(cmdline)})")
-                    app_running = True
-                    break
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-        
-        if app_running:
-            logger.info("Application process is running - assuming active")
-            return True
-        
         # Check if log file exists
         if not os.path.exists(LOG_FILE):
             logger.info(f"Log file {LOG_FILE} not found - assuming active during startup")
@@ -152,13 +139,14 @@ def has_recent_activity():
         
         logger.debug(f"Log file last modified {time_since_modified:.1f} seconds ago")
         
-        if time_since_modified < INACTIVITY_THRESHOLD:
-            logger.debug(f"Log file modified recently (within {INACTIVITY_THRESHOLD}s threshold)")
-            return True  # Log file was modified recently
+        # Consider recent if log file changed within the check interval (more strict than threshold)
+        if time_since_modified < max(CHECK_INTERVAL * 2, 30):
+            logger.debug("Recent file modification detected; treating as active")
+            return True
 
         # Check recent log lines for activity patterns
         with open(LOG_FILE, "r") as f:
-            lines = f.readlines()[-100:]  # Check last 100 lines for efficiency
+            lines = f.readlines()[-300:]  # Check last 300 lines for efficiency
             recent_lines = []
             
             # Look for lines with timestamps within the threshold
@@ -205,32 +193,40 @@ def has_recent_activity():
 
 def stop_pod():
     pod_id = os.environ.get("RUNPOD_POD_ID")
-    if pod_id:
-        logger.warning(f"Stopping pod {pod_id} due to inactivity")
-        logger.info("Recent log contents:")
-        try:
+    logger.warning("Inactivity threshold reached; initiating shutdown")
+    logger.info("Recent log contents:")
+    try:
+        if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "r") as f:
                 lines = f.readlines()[-10:]
                 for line in lines:
                     logger.info(f"Recent log: {line.strip()}")
-        except Exception as e:
-            logger.error(f"Error reading log file: {e}")
-        # Upload logs to S3 before stopping
-        try:
-            upload_results = upload_logs_to_s3()
-            logger.info(f"S3 log upload results: {upload_results}")
-        except Exception as e:
-            logger.error(f"Error uploading logs to S3: {e}")
-        # Centralized shutdown (idempotent)
-        try:
-            perform_pod_shutdown(shutdown_reason="inactivity_monitor", logger=logger)
-        except Exception as e:
-            logger.warning(f"perform_pod_shutdown failed: {e}")
+    except Exception as e:
+        logger.error(f"Error reading log file: {e}")
 
-        subprocess.run(["runpodctl", "stop", "pod", pod_id])
-        logger.info(f"Pod {pod_id} stopped due to inactivity.")
-    else:
-        logger.error("Error: RUNPOD_POD_ID not found.")
+    # Upload logs to S3 before stopping
+    try:
+        upload_results = upload_logs_to_s3()
+        logger.info(f"S3 log upload results: {upload_results}")
+    except Exception as e:
+        logger.error(f"Error uploading logs to S3: {e}")
+
+    # Centralized shutdown (idempotent)
+    try:
+        perform_pod_shutdown(shutdown_reason="inactivity_monitor", logger=logger)
+    except Exception as e:
+        logger.warning(f"perform_pod_shutdown failed: {e}")
+
+    # Prefer runpodctl if present, otherwise signal PID 1 to trigger container shutdown
+    try:
+        if shutil.which("runpodctl") and pod_id:
+            logger.info(f"Using runpodctl to stop pod {pod_id}")
+            subprocess.run(["runpodctl", "stop", "pod", pod_id], check=False)
+        else:
+            logger.warning("runpodctl not available or RUNPOD_POD_ID missing; sending SIGTERM to PID 1")
+            os.kill(1, signal.SIGTERM)
+    except Exception as e:
+        logger.error(f"Failed to stop pod/container gracefully: {e}")
 
 def main():
     logger.info("="*50)
