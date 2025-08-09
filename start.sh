@@ -17,12 +17,14 @@ echo "=================================================="
 # Function to handle graceful shutdown
 cleanup() {
     echo "Received shutdown signal, cleaning up..."
+    # Try to upload logs before killing processes (best-effort)
+    upload_logs_on_shutdown "trap_cleanup"
     # Kill background processes
-    if [ ! -z "$MONITOR_PID" ]; then
+    if [ ! -z "${MONITOR_PID:-}" ]; then
         echo "Stopping inactivity monitor (PID: $MONITOR_PID)..."
         kill $MONITOR_PID 2>/dev/null || true
     fi
-    if [ ! -z "$APP_PID" ]; then
+    if [ ! -z "${APP_PID:-}" ]; then
         echo "Stopping application (PID: $APP_PID)..."
         kill $APP_PID 2>/dev/null || true
     fi
@@ -32,6 +34,19 @@ cleanup() {
 
 # Set up signal handlers
 trap cleanup SIGINT SIGTERM
+
+# Helper: upload logs to S3 via centralized Python routine (best-effort)
+upload_logs_on_shutdown() {
+    local reason=${1:-"shutdown"}
+    echo "Uploading logs to S3 (reason: $reason)..."
+    # Ensure logs are flushed
+    sync || true
+    sleep 1 || true
+    # Provide a list of likely logs
+    SHUTDOWN_REASON="$reason" \
+    EXTRA_LOGS="/app/app.log,/app/inactivity_monitor.log,/tmp/vosk_download.log" \
+    python pod_shutdown.py || true
+}
 
 # Check resources
 echo "Checking system resources..."
@@ -146,6 +161,7 @@ fi
 
 if [ "$IMPORT_TESTS_PASSED" = false ]; then
     echo "ERROR: Critical imports failed. Exiting."
+    upload_logs_on_shutdown "import_failure"
     exit 1
 fi
 
@@ -170,6 +186,7 @@ if ! kill -0 $APP_PID 2>/dev/null; then
     echo "Application log contents:"
     cat app.log 2>/dev/null || echo "No app.log found"
     echo "Container will keep running for debugging purposes..."
+    upload_logs_on_shutdown "app_died_early"
     while true; do
         echo "Container is alive for debugging. Sleeping..."
         sleep 30
@@ -183,6 +200,8 @@ if [ ! -z "$APP_PID" ]; then
     wait $APP_PID
     APP_EXIT_CODE=$?
     echo "Application exited with code: $APP_EXIT_CODE"
+    # Upload logs after normal exit
+    upload_logs_on_shutdown "app_exit_${APP_EXIT_CODE}"
 else
     echo "No application PID to wait for"
     APP_EXIT_CODE=1
