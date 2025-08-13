@@ -126,6 +126,137 @@ if torch.cuda.is_available():
 
 logger.info("All available models loaded successfully!")
 
+def convert_audio_to_wav(input_path, sample_rate=24000, output_dir="/app/audio/converted"):
+    """
+    Convert any audio file to 16-bit mono WAV format with specified sample rate.
+    
+    Args:
+        input_path (str): Path to input audio file
+        sample_rate (int): Target sample rate (default: 24000)
+        output_dir (str): Directory to save converted file
+    
+    Returns:
+        str: Path to converted WAV file, or None if conversion failed
+    """
+    logger.info(f"Converting audio file: {input_path} to 16-bit WAV at {sample_rate}Hz")
+    start_time = datetime.now()
+    
+    if not os.path.exists(input_path):
+        logger.error(f"Input audio file not found: {input_path}")
+        return None
+    
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate output filename
+        input_basename = os.path.basename(input_path)
+        name_without_ext = os.path.splitext(input_basename)[0]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"{name_without_ext}_{sample_rate}hz_{timestamp}.wav"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Log input file info
+        input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+        logger.info(f"Input file size: {input_size:.2f}MB")
+        
+        try:
+            # Method 1: Try PyTorch/torchaudio conversion (faster)
+            logger.info("Attempting PyTorch audio conversion...")
+            
+            # Load audio with torchaudio
+            waveform, orig_sample_rate = torchaudio.load(input_path)
+            logger.info(f"Original format - Sample rate: {orig_sample_rate}Hz, Channels: {waveform.shape[0]}")
+            
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+                logger.info("Converted stereo to mono")
+            
+            # Resample if needed
+            if orig_sample_rate != sample_rate:
+                logger.info(f"Resampling from {orig_sample_rate}Hz to {sample_rate}Hz")
+                resampler = torchaudio.transforms.Resample(orig_freq=orig_sample_rate, new_freq=sample_rate)
+                waveform = resampler(waveform)
+            
+            # Save as 16-bit WAV
+            logger.info(f"Saving converted audio to: {output_path}")
+            torchaudio.save(output_path, waveform, sample_rate, bits_per_sample=16)
+            
+            # Verify the conversion
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
+                logger.info("✓ PyTorch conversion successful")
+                conversion_method = "PyTorch"
+            else:
+                raise RuntimeError("PyTorch conversion produced invalid file")
+                
+        except Exception as e:
+            logger.warning(f"PyTorch conversion failed: {e}, falling back to FFmpeg...")
+            
+            # Method 2: FFmpeg fallback (more reliable for various formats)
+            logger.info("Using FFmpeg for audio conversion...")
+            
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",  # -y to overwrite output file
+                "-i", input_path,  # input file
+                "-ac", "1",       # mono (1 channel)
+                "-ar", str(sample_rate),  # target sample rate
+                "-sample_fmt", "s16",  # 16-bit signed integer
+                "-f", "wav",      # WAV format
+                output_path       # output file
+            ]
+            
+            try:
+                logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+                logger.info("✓ FFmpeg conversion completed successfully")
+                conversion_method = "FFmpeg"
+                
+            except subprocess.CalledProcessError as e:
+                logger.error(f"FFmpeg conversion failed: {e}")
+                logger.error(f"FFmpeg stderr: {e.stderr}")
+                return None
+                
+            except FileNotFoundError:
+                logger.error("FFmpeg not found! Cannot convert audio file")
+                return None
+        
+        # Verify output file
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+            duration = (datetime.now() - start_time).total_seconds()
+            
+            logger.info(f"✓ Audio conversion completed in {duration:.2f}s using {conversion_method}")
+            logger.info(f"Output file: {output_path} ({output_size:.2f}MB)")
+            
+            # Verify audio format with FFprobe if available
+            try:
+                ffprobe_cmd = [
+                    "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", output_path
+                ]
+                probe_result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+                probe_data = json.loads(probe_result.stdout)
+                if "streams" in probe_data and len(probe_data["streams"]) > 0:
+                    audio_stream = probe_data["streams"][0]
+                    logger.info(
+                        f"Verified format - Channels: {audio_stream.get('channels', 'unknown')}, "
+                        f"Sample Rate: {audio_stream.get('sample_rate', 'unknown')}, "
+                        f"Bit Depth: {audio_stream.get('bits_per_sample', 'unknown')}"
+                    )
+            except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+                logger.info("Could not verify audio format with ffprobe")
+            
+            return output_path
+        else:
+            logger.error(f"Conversion failed - output file not found: {output_path}")
+            return None
+            
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Audio conversion error after {duration:.2f}s: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
 # S3 configuration and helpers
 S3_BUCKET = os.environ.get("S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
 S3_PREFIX = os.environ.get("S3_PREFIX") or os.environ.get("S3_DIR") or "uploads"
@@ -188,7 +319,7 @@ def s3_upload_file(local_path, key_prefix=S3_PREFIX):
         logger.error(f"Unexpected S3 upload error: {e}")
         return {"error": str(e)}
 
-def transcribe_whisper(audio_file):
+def transcribe_whisper(audio_file, sample_rate=24000):
     logger.info(f"Whisper transcription started for file: {audio_file}")
     start_time = datetime.now()
     
@@ -196,17 +327,35 @@ def transcribe_whisper(audio_file):
         # Log file info
         if audio_file and os.path.exists(audio_file):
             file_size = os.path.getsize(audio_file) / (1024 * 1024)  # MB
-            logger.info(f"Audio file size: {file_size:.2f}MB")
+            logger.info(f"Original audio file size: {file_size:.2f}MB")
         else:
             logger.error(f"Audio file not found: {audio_file}")
             return {"error": "Audio file not found"}
         
+        # Convert audio to standard format
+        logger.info(f"Converting audio to 16-bit WAV at {sample_rate}Hz...")
+        converted_file = convert_audio_to_wav(audio_file, sample_rate)
+        
+        if not converted_file:
+            logger.error("Audio conversion failed")
+            return {"error": "Audio conversion failed"}
+        
+        logger.info(f"Using converted file: {converted_file}")
+        
         logger.info("Starting Whisper transcription...")
-        result = whisper_model.transcribe(audio_file, word_timestamps=False, beam_size=1)
+        result = whisper_model.transcribe(converted_file, word_timestamps=False, beam_size=1)
         
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(f"✓ Whisper transcription completed in {duration:.2f}s")
         logger.info(f"Transcribed text length: {len(result.get('text', ''))}")
+        
+        # Add conversion info to result
+        result["audio_conversion"] = {
+            "original_file": audio_file,
+            "converted_file": converted_file,
+            "target_sample_rate": sample_rate,
+            "format": "16-bit mono WAV"
+        }
         
         return result
     except Exception as e:
@@ -216,7 +365,7 @@ def transcribe_whisper(audio_file):
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
-def transcribe_whisper_filepath(file_path):
+def transcribe_whisper_filepath(file_path, sample_rate=24000):
     """Whisper transcription function that accepts server-side file paths"""
     logger.info(f"Whisper filepath transcription started for: {file_path}")
     
@@ -227,7 +376,7 @@ def transcribe_whisper_filepath(file_path):
         return {"error": error_msg}
     
     # Use the existing transcribe_whisper function
-    return transcribe_whisper(file_path)
+    return transcribe_whisper(file_path, sample_rate)
 
 def transcribe_vosk(audio_file, sample_rate=24000):
     logger.info(f"VOSK transcription started for file: {audio_file} with sample rate: {sample_rate}")
@@ -241,20 +390,30 @@ def transcribe_vosk(audio_file, sample_rate=24000):
         # Log file info
         if audio_file and os.path.exists(audio_file):
             file_size = os.path.getsize(audio_file) / (1024 * 1024)  # MB
-            logger.info(f"Audio file size: {file_size:.2f}MB")
+            logger.info(f"Original audio file size: {file_size:.2f}MB")
         else:
             logger.error(f"Audio file not found: {audio_file}")
             return {"error": "Audio file not found"}
+        
+        # Convert audio to standard format
+        logger.info(f"Converting audio to 16-bit WAV at {sample_rate}Hz...")
+        converted_file = convert_audio_to_wav(audio_file, sample_rate)
+        
+        if not converted_file:
+            logger.error("Audio conversion failed")
+            return {"error": "Audio conversion failed"}
+        
+        logger.info(f"Using converted file: {converted_file}")
         
         # Initialize the recognizer with the model
         logger.info(f"Initializing VOSK recognizer with sample rate: {sample_rate}...")
         recognizer = KaldiRecognizer(vosk_model, sample_rate)
         recognizer.SetWords(True)
         
-        # Open the audio file
+        # Open the converted audio file
         logger.info("Processing audio chunks...")
         chunks_processed = 0
-        with open(audio_file, "rb") as audio:
+        with open(converted_file, "rb") as audio:
             while True:
                 # Read a chunk of the audio file
                 data = audio.read(4000)
@@ -271,6 +430,14 @@ def transcribe_vosk(audio_file, sample_rate=24000):
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(f"✓ VOSK transcription completed in {duration:.2f}s")
         logger.info(f"Transcribed text: {result_dict.get('text', 'No text')}")
+        
+        # Add conversion info to result
+        result_dict["audio_conversion"] = {
+            "original_file": audio_file,
+            "converted_file": converted_file,
+            "target_sample_rate": sample_rate,
+            "format": "16-bit mono WAV"
+        }
         
         return result_dict
     except Exception as e:
@@ -508,7 +675,10 @@ try:
     logger.info("Creating Whisper interface...")
     whisper_iface = gr.Interface(
         fn=transcribe_whisper,
-        inputs=gr.Audio(type="filepath", label="Upload audio for Whisper transcription"),
+        inputs=[
+            gr.Audio(type="filepath", label="Upload audio for Whisper transcription"),
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
+        ],
         outputs=gr.JSON(label="Whisper Result"),
         title="OpenAI Whisper Turbo Transcription",
         api_name="whisper"
@@ -518,7 +688,10 @@ try:
     logger.info("Creating Whisper filepath interface...")
     whisper_filepath_iface = gr.Interface(
         fn=transcribe_whisper_filepath,
-        inputs=gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
+        inputs=[
+            gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
+        ],
         outputs=gr.JSON(label="Whisper Result"),
         title="OpenAI Whisper Turbo (Server Files)",
         api_name="whisper_filepath"
@@ -530,7 +703,7 @@ try:
         fn=transcribe_vosk,
         inputs=[
             gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
-            gr.Number(label="Sample Rate", value=24000, precision=0)
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
         ],
         outputs=gr.JSON(label="VOSK Result"),
         title="VOSK Transcription",
@@ -543,7 +716,7 @@ try:
         fn=transcribe_vosk_filepath,
         inputs=[
             gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
-            gr.Number(label="Sample Rate", value=24000, precision=0)
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
         ],
         outputs=gr.JSON(label="VOSK Result"),
         title="VOSK Transcription (Server Files)",
