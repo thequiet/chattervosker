@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 ACTIVITY_PATTERNS = [
-    r"Starting ChatteVosker Application",
+    r"Starting ChatterVosker Application",
     r"Loading.*model",
     r"Checking VOSK model",
     r"Initializing models",

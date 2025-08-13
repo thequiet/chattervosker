@@ -45,7 +45,7 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 sys.excepthook = handle_exception
 
 logger.info("="*50)
-logger.info("Starting ChatteVosker Application")
+logger.info("Starting ChatterVosker Application")
 logger.info(f"Python version: {sys.version}")
 logger.info(f"Start time: {datetime.now()}")
 logger.info("="*50)
@@ -229,7 +229,7 @@ def transcribe_whisper_filepath(file_path):
     # Use the existing transcribe_whisper function
     return transcribe_whisper(file_path)
 
-def transcribe_vosk(audio_file, sample_rate=16000):
+def transcribe_vosk(audio_file, sample_rate=24000):
     logger.info(f"VOSK transcription started for file: {audio_file} with sample rate: {sample_rate}")
     start_time = datetime.now()
     
@@ -280,7 +280,7 @@ def transcribe_vosk(audio_file, sample_rate=16000):
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
-def transcribe_vosk_filepath(file_path, sample_rate=16000):
+def transcribe_vosk_filepath(file_path, sample_rate=24000):
     """VOSK transcription function that accepts server-side file paths"""
     logger.info(f"VOSK filepath transcription started for: {file_path}")
     
@@ -348,7 +348,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             wav = chatterbox_model.generate(text, **generation_params)
         
         # Try direct encoding first (faster), fallback to FFmpeg if needed
-        logger.info("Converting audio to standard format (mono, 16kHz, 16-bit)...")
+        logger.info("Converting audio to standard format (mono, 24kHz, 16-bit)...")
         
         try:
             # Method 1: Direct PyTorch conversion (faster)
@@ -359,9 +359,9 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 wav = torch.mean(wav, dim=0, keepdim=True)
                 logger.info("Converted stereo to mono")
             
-            # Resample to 16kHz if needed
+            # Resample to 24kHz if needed
             original_sr = chatterbox_model.sr
-            target_sr = 16000
+            target_sr = 24000
             if original_sr != target_sr:
                 logger.info(f"Resampling from {original_sr}Hz to {target_sr}Hz")
                 resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=target_sr)
@@ -396,7 +396,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 "ffmpeg", "-y",  # -y to overwrite output file
                 "-i", temp_path,  # input file
                 "-ac", "1",       # mono (1 channel)
-                "-ar", "16000",   # 16kHz sample rate
+                "-ar", "24000",   # 24kHz sample rate
                 "-sample_fmt", "s16",  # 16-bit signed integer
                 "-f", "wav",      # WAV format
                 output_path       # output file
@@ -462,7 +462,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 "filename": final_output_filename,
                 "file_size_mb": round(output_size, 2),
                 "generation_time_seconds": round(duration, 2),
-                "audio_format": "mono WAV, 16kHz, 16-bit",
+                "audio_format": "mono WAV, 24kHz, 16-bit",
                 "conversion_method": conversion_method,
                 "parameters": {
                     "exaggeration": exaggeration,
@@ -530,7 +530,7 @@ try:
         fn=transcribe_vosk,
         inputs=[
             gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
-            gr.Number(label="Sample Rate", value=16000, precision=0)
+            gr.Number(label="Sample Rate", value=24000, precision=0)
         ],
         outputs=gr.JSON(label="VOSK Result"),
         title="VOSK Transcription",
@@ -543,7 +543,7 @@ try:
         fn=transcribe_vosk_filepath,
         inputs=[
             gr.Textbox(label="Server File Path", placeholder="/app/audio/output/filename.wav", info="Path to audio file on server"),
-            gr.Number(label="Sample Rate", value=16000, precision=0)
+            gr.Number(label="Sample Rate", value=24000, precision=0)
         ],
         outputs=gr.JSON(label="VOSK Result"),
         title="VOSK Transcription (Server Files)",
