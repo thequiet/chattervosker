@@ -297,8 +297,7 @@ def s3_upload_file(local_path, key_prefix=S3_PREFIX):
         return None
     try:
         basename = os.path.basename(local_path)
-        date_prefix = datetime.utcnow().strftime("%Y/%m/%d")
-        key_parts = [p for p in [key_prefix, date_prefix, basename] if p]
+        key_parts = [p for p in [key_prefix, basename] if p]
         s3_key = "/".join([part.strip("/") for part in key_parts])
         logger.info(f"Uploading {local_path} to s3://{S3_BUCKET}/{s3_key}")
         client.upload_file(local_path, S3_BUCKET, s3_key)
